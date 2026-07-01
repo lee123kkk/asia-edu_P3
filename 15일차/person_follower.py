@@ -1,213 +1,159 @@
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, Point
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String, Int32
+from std_msgs.msg import Int32, String
 from rclpy.qos import qos_profile_sensor_data
 import math
 import time
 
-class PersonFollower(Node):
+class PickupAligner(Node):
     def __init__(self):
-        super().__init__('person_follower')
+        super().__init__('pickup_aligner')
         
         self.mode_sub = self.create_subscription(Int32, '/internal_mode', self.mode_callback, 10)
-        self.subscription = self.create_subscription(Twist, '/target_cmd', self.target_callback, 10)
+        self.target_sub = self.create_subscription(Point, '/pickup_target', self.target_callback, 10)
         self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_callback, qos_profile_sensor_data)
         
-        self.publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.ack_pub = self.create_publisher(Int32, '/AGV_mode_ack', 10)
+        self.status_pub = self.create_publisher(Int32, '/AGV_status', 10)
         self.log_pub = self.create_publisher(String, '/AGV_log', 10)
         
-        self.current_agv_mode = 0 
-        self.target_distance = 1.0   
-        self.safe_distance = 0.45    
+        self.current_agv_mode = 0
+        self.state = 'WAITING' 
         
-        self.kp_linear = 0.4         
-        self.max_linear_speed = 0.25 
-        self.deadband_linear = 0.1
-        self.kp_angular = 0.7        
-        self.max_angular_speed = 0.5 
-        self.deadband_angular = 0.08 
+        self.target_y = 0.0
+        self.crab_start_time = 0.0
+        self.crab_duration = 0.0
+        self.crab_direction = 0.0
         
-        self.search_speed = 0.3        
-        self.search_rotate_duration = math.radians(10.0) / self.search_speed
+        self.last_log_time = time.time()
         
-        self.min_dist_front = float('inf')
-        self.min_dist_left = float('inf')
-        self.min_dist_right = float('inf')
-        
-        # [신규] 타겟을 놓쳤을 때 찾기 위해 마지막 각도를 기억하는 변수
-        self.last_known_angle = 0.0 
-        
-        self.last_msg_time = self.get_clock().now()
-        self.last_log_time = self.get_clock().now()
-        self.current_mode_text = "🟢 INIT"
-        
-        self.is_searching = False
-        self.search_start_time = 0.0
-        self.search_direction = 0.0 
-        
-        self.watchdog_timer = self.create_timer(0.1, self.watchdog_check)
-        self.get_logger().info('Person Follower Node (스마트 탐색 및 모드별 라이다 분리 적용) started!')
+        self.get_logger().info('🧩 픽업 정밀 밀착 노드 가동 (라이다 180도 위상 보정 및 20cm 절대 정지 적용)')
 
     def send_log(self, text, level='info'):
         if level == 'info': self.get_logger().info(text)
         elif level == 'warn': self.get_logger().warn(text)
-        elif level == 'error': self.get_logger().error(text)
-        
         msg = String()
-        msg.data = f"[추종/유도] {text}"
+        msg.data = f"[픽업 밀착] {text}"
         self.log_pub.publish(msg)
 
     def mode_callback(self, msg):
-        prev_mode = self.current_agv_mode
         self.current_agv_mode = msg.data
-
-        if self.current_agv_mode == 10 and prev_mode != 10:
-            self.target_distance = 1.0
-            self.safe_distance = 0.45
-            self.send_log('▶️ 10번 모드 진입: 1.0m 간격 사람 추종을 시작합니다.')
-            now = self.get_clock().now()
-            self.last_msg_time = now
-            self.last_log_time = now
-            
-        elif self.current_agv_mode == 50 and prev_mode != 50:
-            self.target_distance = 0.30  
-            self.safe_distance = 0.20    
-            self.send_log('▶️ 50번 모드 진입: 30cm 근접 픽업 유도를 시작합니다.')
-            now = self.get_clock().now()
-            self.last_msg_time = now
-            self.last_log_time = now
-            
-        elif prev_mode in [10, 50] and self.current_agv_mode not in [10, 50]:
-            self.send_log('⏹️ 추종/유도 모드 해제: 즉시 브레이크를 작동합니다.')
-            self.emergency_stop()
-
-    def scan_callback(self, msg):
-        if self.current_agv_mode not in [10, 50]: return
-        
-        min_f, min_l, min_r = float('inf'), float('inf'), float('inf')
-
-        for i, r in enumerate(msg.ranges):
-            if r < 0.05 or r > 10.0 or math.isinf(r) or math.isnan(r): continue
-            angle = msg.angle_min + i * msg.angle_increment
-            deg = math.degrees(math.atan2(math.sin(angle), math.cos(angle)))
-
-            # [핵심] 10번 모드와 50번 모드의 라이다 시야각 분리
-            if self.current_agv_mode == 10:
-                # 일반 추종: 넓은 시야 (전방 ±40도)
-                if -40 <= deg <= 40: min_f = min(min_f, r)
-                elif 40 < deg <= 90: min_l = min(min_l, r)
-                elif -90 <= deg < -40: min_r = min(min_r, r)
-            elif self.current_agv_mode == 50:
-                # 픽업 유도: 좁은 시야 (전방 ±20도) - 주변 사물 오인 방지
-                if -20 <= deg <= 20: min_f = min(min_f, r)
-                elif 20 < deg <= 60: min_l = min(min_l, r)
-                elif -60 <= deg < -20: min_r = min(min_r, r)
-
-        self.min_dist_front, self.min_dist_left, self.min_dist_right = min_f, min_l, min_r
+        if self.current_agv_mode != 51:
+            self.state = 'WAITING'
 
     def target_callback(self, msg):
-        if self.current_agv_mode not in [10, 50]: return
-        self.last_msg_time = self.get_clock().now()
+        if self.current_agv_mode != 51: return
         
-        mode = msg.linear.z
-        current_distance = msg.linear.x
-        target_angle_rad = msg.angular.z
-        
-        cmd_msg = Twist()
-        status_text = f"🎯 TRACKING ({int(self.target_distance*100)}cm)"
-
-        if mode == 0.0:
-            # 타겟을 보고 있을 때 마지막 각도를 지속적으로 기억
-            self.last_known_angle = target_angle_rad 
-            self.is_searching = False 
+        if self.state == 'WAITING':
+            self.target_y = msg.y
+            self.send_log(f'🎯 목표 좌표 수신 (Y오차: {self.target_y:.2f}m). 52번 신호 발송.')
             
-            if self.min_dist_front < self.safe_distance:
-                status_text = "🚨 AVOIDANCE"
-                cmd_msg.linear.x = -0.15 
-                if self.min_dist_left > self.min_dist_right: cmd_msg.angular.z = 0.4  
-                else: cmd_msg.angular.z = -0.4 
+            for _ in range(3):
+                ack_msg = Int32()
+                ack_msg.data = 52
+                self.ack_pub.publish(ack_msg)
+            
+            speed_y = 0.1 
+            self.crab_duration = abs(self.target_y) / speed_y
+            self.crab_direction = 1.0 if self.target_y > 0 else -1.0
+            
+            self.crab_start_time = time.time()
+            self.state = 'CRAB_WALK'
+
+    def scan_callback(self, msg):
+        if self.current_agv_mode != 51: return
+        if self.state == 'WAITING' or self.state == 'DONE': return
+        
+        current_time = time.time()
+        twist = Twist()
+        
+        if self.state == 'CRAB_WALK':
+            if current_time - self.crab_start_time < self.crab_duration:
+                twist.linear.y = 0.1 * self.crab_direction
+                self.cmd_vel_pub.publish(twist)
             else:
-                distance_error = current_distance - self.target_distance
-                if abs(distance_error) < self.deadband_linear: cmd_msg.linear.x = 0.0
-                else: cmd_msg.linear.x = max(min(distance_error * self.kp_linear, self.max_linear_speed), -self.max_linear_speed)
-
-                if abs(target_angle_rad) < self.deadband_angular: cmd_msg.angular.z = 0.0
-                else: cmd_msg.angular.z = max(min(target_angle_rad * self.kp_angular, self.max_angular_speed), -self.max_angular_speed)
-
-        elif mode == 1.0 or mode == 2.0:
-            status_text = "🔍⬅️ SEARCH_L" if mode == 1.0 else "🔍➡️ SEARCH_R"
-            direction = 1.0 if mode == 1.0 else -1.0
-            current_time = time.time()
-            total_step_duration = self.search_rotate_duration + 0.5 
-            
-            if not self.is_searching or (current_time - self.search_start_time > total_step_duration):
-                self.is_searching = True
-                self.search_start_time = current_time
-                self.search_direction = direction
-
-            if current_time - self.search_start_time < self.search_rotate_duration:
-                cmd_msg.angular.z = self.search_direction * self.search_speed
-                status_text += "_ROT"
-            else:
-                status_text += "_WAIT"
-
-        elif mode == 3.0:
-            # FSM에서 3.0(놓침)을 명시적으로 보내올 경우 자율 탐색 시작
-            self.is_searching = True
-            direction = 1.0 if self.last_known_angle >= 0 else -1.0
-            cmd_msg.angular.z = direction * self.search_speed
-            status_text = "🔍⬅️ AUTO_SEARCH" if direction > 0 else "🔍➡️ AUTO_SEARCH"
-
-        self.publisher.publish(cmd_msg)
-        self.current_mode_text = status_text
-        self.print_clean_log(current_distance, target_angle_rad)
-
-    def watchdog_check(self):
-        if self.current_agv_mode not in [10, 50]: return
-        now = self.get_clock().now()
-        time_diff = (now - self.last_msg_time).nanoseconds / 1e9
-        
-        # [신규] 신호가 끊겼을 때 (0.5초 ~ 5.0초 사이) -> 즉시 정지하지 않고 마지막 위치로 회전 탐색
-        if 0.5 < time_diff < 5.0:
-            cmd_msg = Twist()
-            direction = 1.0 if self.last_known_angle >= 0 else -1.0
-            cmd_msg.angular.z = direction * self.search_speed
-            self.publisher.publish(cmd_msg)
-            
-            if (now - self.last_log_time).nanoseconds / 1e9 > 1.0:
-                dir_str = "좌측" if direction > 0 else "우측"
-                self.send_log(f'⚠️ 대상 유실! 마지막 위치({dir_str})로 회전하며 탐색합니다. ({time_diff:.1f}s)', 'warn')
-                self.last_log_time = now
+                self.send_log('🦀 측면 정렬 완료. 전방 평행 밀착을 시작합니다.')
+                self.state = 'ALIGNING'
                 
-        # 5초 이상 회전해도 못 찾으면 포기하고 정지
-        elif time_diff >= 5.0:
-            self.emergency_stop() 
-            if (now - self.last_log_time).nanoseconds / 1e9 > 2.0:
-                self.send_log('💀 5초 이상 대상 유실. 탐색을 포기하고 대기합니다.', 'error')
-                self.last_log_time = now
-
-    def print_clean_log(self, dist, angle):
-        now = self.get_clock().now()
-        if (now - self.last_log_time).nanoseconds / 1e9 >= 0.5:
-            log_str = f"[{self.current_mode_text}] Dist: {dist:.2f}m, Ang: {angle:.2f}rad | Lidar: {self.min_dist_front:.1f}m"
-            self.send_log(log_str)
-            self.last_log_time = now
-
-    def emergency_stop(self):
-        stop_msg = Twist()
-        for _ in range(3):
-            self.publisher.publish(stop_msg)
-            time.sleep(0.05)
+        elif self.state == 'ALIGNING':
+            min_stop_dist = float('inf') 
+            min_l = float('inf') 
+            min_r = float('inf') 
+            
+            for i, r in enumerate(msg.ranges):
+                if r < 0.05 or r > 8.0 or math.isinf(r) or math.isnan(r): continue
+                
+                # 센서의 순수 각도 계산
+                angle = msg.angle_min + i * msg.angle_increment
+                raw_deg = math.degrees(math.atan2(math.sin(angle), math.cos(angle)))
+                
+                # [핵심 수정] 라이다의 0도가 로봇 뒤통수를 향하고 있으므로 180도 위상 보정
+                real_front_deg = raw_deg + 180.0
+                if real_front_deg > 180.0:
+                    real_front_deg -= 360.0
+                
+                # 이제 real_front_deg 기준 0도가 '진짜 앞 범퍼 방향'입니다!
+                if -40 <= real_front_deg <= 40: 
+                    min_stop_dist = min(min_stop_dist, r)
+                    
+                # 평행 정렬용 (정중앙을 피해 좌우측 시야 사용)
+                if 15 <= real_front_deg <= 45: min_l = min(min_l, r)
+                elif -45 <= real_front_deg <= -15: min_r = min(min_r, r)
+                
+            if math.isinf(min_stop_dist): min_stop_dist = 9.99
+            if math.isinf(min_l): min_l = 9.99
+            if math.isinf(min_r): min_r = 9.99
+            
+            diff = 0.0
+            if min_l != 9.99 and min_r != 9.99:
+                diff = min_l - min_r
+            
+            if current_time - self.last_log_time > 0.5:
+                self.send_log(f'🔍 [진짜 정면] 정지거리: {min_stop_dist:.2f}m | 좌: {min_l:.2f}m | 우: {min_r:.2f}m | 평행오차: {abs(diff):.2f}m')
+                self.last_log_time = current_time
+            
+            # ----------------------------------------------------
+            # 제어 로직 (라이다 20cm 정지 절대 0순위)
+            # ----------------------------------------------------
+            
+            # [0순위] 진짜 정면 거리가 20cm(0.20m) 이하가 되면 즉각 종료
+            if min_stop_dist <= 0.20:
+                twist.linear.x = 0.0
+                twist.linear.y = 0.0
+                twist.angular.z = 0.0
+                self.cmd_vel_pub.publish(twist)
+                
+                self.send_log('✅ 라이다 기준 딱 20cm 정밀 밀착 완료! 즉시 멈추고 1번 신호를 발송합니다.')
+                for _ in range(3):
+                    status_msg = Int32()
+                    status_msg.data = 1
+                    self.status_pub.publish(status_msg)
+                
+                self.state = 'DONE'
+                return
+                
+            # [1순위] 각도가 2.5cm 이상 틀어져 있으면 직진 멈추고 제자리 회전
+            elif abs(diff) > 0.025 and min_l != 9.99 and min_r != 9.99:
+                twist.linear.x = 0.0  
+                twist.angular.z = 0.15 if diff > 0 else -0.15
+                
+            # [2순위] 20cm에 도달하지 않았고 각도도 맞았다면 전진
+            else:
+                twist.angular.z = 0.0  
+                twist.linear.x = 0.05  
+                
+            self.cmd_vel_pub.publish(twist)
 
 def main(args=None):
     rclpy.init(args=args)
-    node = PersonFollower()
+    node = PickupAligner()
     try: rclpy.spin(node)
     except KeyboardInterrupt: pass
     finally:
-        node.emergency_stop()
+        node.cmd_vel_pub.publish(Twist())
         node.destroy_node()
         rclpy.shutdown()
 
